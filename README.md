@@ -1,6 +1,6 @@
 # LinuxSCP
 
-A WinSCP-compatible SFTP/SCP/FTP client for Linux, built with Python and PyQt6.
+A WinSCP-Inspired SFTP/SCP/FTP client for Linux, built with Python and PyQt6.
 
 ![LinuxSCP screenshot](docs/screenshot.png)
 
