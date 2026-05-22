@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+paramiko>=3.4.0
+ftputil>=5.0.4
+webdavclient3>=3.14.6
