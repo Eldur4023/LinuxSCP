@@ -1,18 +1,14 @@
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QTreeWidget, QTreeWidgetItem,
-    QPushButton, QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
-    QTabWidget, QWidget, QGroupBox, QFormLayout, QFileDialog,
-    QMessageBox, QSplitter, QSizePolicy,
+    QPushButton, QLabel, QLineEdit, QComboBox, QSpinBox,
+    QTabWidget, QWidget, QFormLayout, QFileDialog,
+    QMessageBox, QSplitter, QMenu,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint
+from PyQt6.QtGui import QKeySequence, QShortcut
 
 from linuxscp.ui.styles import SITE_MANAGER_STYLE
-from linuxscp.core.config_store import (
-    StoredSession, load_sessions, save_sessions,
-)
-
-_ROLE = Qt.ItemDataRole.UserRole   # stores SessionData on each leaf item
+from linuxscp.core.config_store import StoredSession, load_sessions, save_sessions
 
 
 class SessionData:
@@ -26,110 +22,107 @@ class SessionData:
         self.key_file   = ""
         self.remote_dir = ""
         self.local_dir  = ""
-        self.notes      = ""
-
-
-def _item_data(item: QTreeWidgetItem) -> SessionData | None:
-    """Return the SessionData stored on a tree item, or None for folders."""
-    return item.data(0, _ROLE)
-
-
-def _set_item_data(item: QTreeWidgetItem, data: SessionData):
-    item.setData(0, _ROLE, data)
 
 
 class SiteManager(QDialog):
-    connect_requested = pyqtSignal(object)   # emits SessionData
+    connect_requested = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Site Manager – LinuxSCP")
         self.setMinimumSize(780, 520)
         self.setStyleSheet(SITE_MANAGER_STYLE)
+
+        # id(item) → SessionData  (avoids PyQt6 setData copy problem)
+        self._data: dict[int, SessionData] = {}
         self._current_item: QTreeWidgetItem | None = None
-        self._building = False
+        self._loading = False   # suppress signals while populating form
+
         self._build_ui()
         self._load_from_disk()
 
-    # ── UI construction ───────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        root_layout = QVBoxLayout(self)
-        root_layout.setContentsMargins(8, 8, 8, 8)
-        root_layout.setSpacing(6)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # ── Left: site tree + tree buttons ───────────────────────────────
+        # Left panel
         left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(4)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(4)
 
         self._tree = QTreeWidget()
         self._tree.setObjectName("SiteTree")
         self._tree.setHeaderHidden(True)
         self._tree.setMinimumWidth(220)
         self._tree.itemClicked.connect(self._on_item_clicked)
-        left_layout.addWidget(self._tree)
+        self._tree.itemChanged.connect(self._on_item_renamed)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._show_context_menu)
+        ll.addWidget(self._tree)
 
-        tree_btns = QHBoxLayout()
-        for label, slot in (
-            ("New Site",   self._new_site),
-            ("New Folder", self._new_folder),
-            ("Delete",     self._delete_item),
-        ):
-            btn = QPushButton(label)
-            btn.setFixedHeight(24)
-            btn.clicked.connect(slot)
-            tree_btns.addWidget(btn)
-        left_layout.addLayout(tree_btns)
+        del_sc = QShortcut(QKeySequence(Qt.Key.Key_Delete), self._tree)
+        del_sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+        del_sc.activated.connect(self._delete_item)
+
+        btns = QHBoxLayout()
+        for label, slot in (("New Site", self._new_site),
+                            ("New Folder", self._new_folder),
+                            ("Delete", self._delete_item)):
+            b = QPushButton(label)
+            b.setFixedHeight(24)
+            b.clicked.connect(slot)
+            btns.addWidget(b)
+        ll.addLayout(btns)
         splitter.addWidget(left)
 
-        # ── Right: session form ───────────────────────────────────────────
+        # Right panel
         right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(4, 0, 0, 0)
-        right_layout.setSpacing(6)
-
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(4, 0, 0, 0)
+        rl.setSpacing(6)
         self._tabs = QTabWidget()
-        right_layout.addWidget(self._tabs)
+        rl.addWidget(self._tabs)
         splitter.addWidget(right)
         splitter.setSizes([240, 520])
+        root.addWidget(splitter)
 
-        root_layout.addWidget(splitter)
-
-        # ── Bottom buttons ────────────────────────────────────────────────
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
+        # Bottom buttons
+        br = QHBoxLayout()
+        br.addStretch()
         self._btn_save = QPushButton("Save")
         self._btn_save.setFixedSize(90, 28)
         self._btn_save.clicked.connect(self._save_current)
-
         self._btn_connect = QPushButton("Login")
         self._btn_connect.setObjectName("ConnectBtn")
         self._btn_connect.setFixedSize(90, 28)
         self._btn_connect.clicked.connect(self._do_connect)
-
         btn_close = QPushButton("Close")
         btn_close.setFixedSize(90, 28)
         btn_close.clicked.connect(self.reject)
-
-        btn_row.addWidget(self._btn_save)
-        btn_row.addWidget(btn_close)
-        btn_row.addSpacing(12)
-        btn_row.addWidget(self._btn_connect)
-        root_layout.addLayout(btn_row)
+        br.addWidget(self._btn_save)
+        br.addWidget(btn_close)
+        br.addSpacing(12)
+        br.addWidget(self._btn_connect)
+        root.addLayout(br)
 
         self._build_session_tab()
+        self._set_form_enabled(False)
 
     def _build_session_tab(self):
-        session_tab = QWidget()
-        form = QFormLayout(session_tab)
+        tab = QWidget()
+        form = QFormLayout(tab)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setSpacing(8)
         form.setContentsMargins(12, 12, 12, 12)
+
+        self._f_name = QLineEdit()
+        self._f_name.setPlaceholderText("My Server")
 
         self._f_protocol = QComboBox()
         self._f_protocol.addItems(["SFTP", "SCP", "FTP", "FTPS", "WebDAV", "S3"])
@@ -173,6 +166,7 @@ class SiteManager(QDialog):
         local_row.addWidget(self._f_local_dir)
         local_row.addWidget(self._btn_browse_local)
 
+        form.addRow("Display name:", self._f_name)
         form.addRow("File Protocol:", self._f_protocol)
         form.addRow("Host name:", self._f_host)
         form.addRow("Port number:", self._f_port)
@@ -182,75 +176,62 @@ class SiteManager(QDialog):
         form.addRow("Remote directory:", self._f_remote_dir)
         form.addRow("Local directory:", local_row)
 
-        self._tabs.addTab(session_tab, "Session")
+        self._tabs.addTab(tab, "Session")
 
-        adv_tab = QWidget()
-        adv_layout = QVBoxLayout(adv_tab)
-        adv_layout.addWidget(QLabel("Advanced settings — coming soon."))
-        adv_layout.addStretch()
-        self._tabs.addTab(adv_tab, "Advanced")
+        adv = QWidget()
+        adv_l = QVBoxLayout(adv)
+        adv_l.addWidget(QLabel("Advanced settings — coming soon."))
+        adv_l.addStretch()
+        self._tabs.addTab(adv, "Advanced")
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _get_data(self, item: QTreeWidgetItem) -> SessionData | None:
+        return self._data.get(id(item))
+
+    def _set_data(self, item: QTreeWidgetItem, data: SessionData):
+        self._data[id(item)] = data
+
+    def _is_folder(self, item: QTreeWidgetItem) -> bool:
+        return id(item) not in self._data
 
     # ── Persistence ───────────────────────────────────────────────────────
 
     def _load_from_disk(self):
+        self._loading = True
         stored = load_sessions()
         groups: dict[str, QTreeWidgetItem] = {}
 
         def _get_group(name: str) -> QTreeWidgetItem:
             if name not in groups:
-                item = QTreeWidgetItem(self._tree, [name])
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                groups[name] = item
+                g = QTreeWidgetItem(self._tree, [name])
+                g.setFlags(g.flags() | Qt.ItemFlag.ItemIsEditable)
+                groups[name] = g
             return groups[name]
 
         if not stored:
-            root = QTreeWidgetItem(self._tree, ["My Sites"])
-            root.setFlags(root.flags() | Qt.ItemFlag.ItemIsEditable)
+            g = QTreeWidgetItem(self._tree, ["My Sites"])
+            g.setFlags(g.flags() | Qt.ItemFlag.ItemIsEditable)
         else:
             for ss in stored:
                 grp = _get_group(ss.group or "My Sites")
                 data = _stored_to_session_data(ss)
-                display = f"{ss.user}@{ss.host}" if ss.host else ss.name
-                item = QTreeWidgetItem(grp, [display])
+                label = ss.name or (f"{ss.user}@{ss.host}" if ss.host else "Session")
+                item = QTreeWidgetItem(grp, [label])
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                _set_item_data(item, data)
+                self._set_data(item, data)
 
         self._tree.expandAll()
+        self._loading = False
         self._auto_select_first()
-
-    def _auto_select_first(self):
-        """Select first session leaf, or open blank form if none exist."""
-        root = self._tree.invisibleRootItem()
-
-        def _first_leaf(item: QTreeWidgetItem) -> QTreeWidgetItem | None:
-            if _item_data(item) is not None:
-                return item
-            for i in range(item.childCount()):
-                found = _first_leaf(item.child(i))
-                if found:
-                    return found
-            return None
-
-        leaf = None
-        for i in range(root.childCount()):
-            leaf = _first_leaf(root.child(i))
-            if leaf:
-                break
-
-        if leaf:
-            self._tree.setCurrentItem(leaf)
-            self._on_item_clicked(leaf, 0)
-        else:
-            # No saved sessions — open a blank form ready to fill in
-            self._new_site()
 
     def _save_to_disk(self):
         stored: list[StoredSession] = []
 
-        def _walk(parent_item: QTreeWidgetItem, group_name: str):
-            for i in range(parent_item.childCount()):
-                child = parent_item.child(i)
-                d = _item_data(child)
+        def _walk(parent: QTreeWidgetItem, group_name: str):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                d = self._get_data(child)
                 if d is not None:
                     stored.append(StoredSession(
                         name       = child.text(0),
@@ -274,33 +255,53 @@ class SiteManager(QDialog):
 
         save_sessions(stored)
 
+    def _auto_select_first(self):
+        root = self._tree.invisibleRootItem()
+
+        def _first_leaf(item):
+            if self._get_data(item) is not None:
+                return item
+            for i in range(item.childCount()):
+                found = _first_leaf(item.child(i))
+                if found:
+                    return found
+            return None
+
+        leaf = None
+        for i in range(root.childCount()):
+            leaf = _first_leaf(root.child(i))
+            if leaf:
+                break
+
+        if leaf:
+            self._tree.setCurrentItem(leaf)
+            self._on_item_clicked(leaf, 0)
+        else:
+            self._new_site()
+
     # ── Tree actions ──────────────────────────────────────────────────────
 
     def _new_site(self):
         cur = self._tree.currentItem()
-        # Find the target folder: if current item is a session leaf, go to its parent
-        if cur is not None and _item_data(cur) is not None:
+        if cur is not None and self._get_data(cur) is not None:
             folder = cur.parent() or self._tree.topLevelItem(0)
         elif cur is not None:
-            folder = cur   # cur is a folder
+            folder = cur
         else:
             folder = self._tree.topLevelItem(0)
 
-        if folder is not None:
-            item = QTreeWidgetItem(folder, ["New Session"])
-        else:
-            # No top-level folder at all; create a root folder on the fly
+        if folder is None:
             folder = QTreeWidgetItem(self._tree, ["My Sites"])
             folder.setFlags(folder.flags() | Qt.ItemFlag.ItemIsEditable)
-            item = QTreeWidgetItem(folder, ["New Session"])
 
+        item = QTreeWidgetItem(folder, ["New Session"])
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
         data = SessionData()
-        _set_item_data(item, data)
+        self._set_data(item, data)
         self._current_item = item
         self._tree.expandAll()
         self._tree.setCurrentItem(item)
-        self._load_session(data)
+        self._load_form(data)
         self._set_form_enabled(True)
         self._f_host.setFocus()
 
@@ -308,38 +309,65 @@ class SiteManager(QDialog):
         folder = QTreeWidgetItem(self._tree, ["New Folder"])
         folder.setFlags(folder.flags() | Qt.ItemFlag.ItemIsEditable)
         self._tree.setCurrentItem(folder)
+        self._save_to_disk()
         self._tree.editItem(folder)
 
     def _delete_item(self):
         item = self._tree.currentItem()
         if not item:
             return
-        name = item.text(0)
         reply = QMessageBox.question(
-            self, "Delete", f'Delete "{name}"?',
+            self, "Delete", f'Delete "{item.text(0)}"?',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             if self._current_item is item:
                 self._current_item = None
-            parent = item.parent() or self._tree.invisibleRootItem()
-            parent.removeChild(item)
-            self._set_form_enabled(False)
+                self._set_form_enabled(False)
+            self._data.pop(id(item), None)
+            (item.parent() or self._tree.invisibleRootItem()).removeChild(item)
+            self._save_to_disk()
 
     def _on_item_clicked(self, item: QTreeWidgetItem, _col):
-        data = _item_data(item)
+        data = self._get_data(item)
         if data is not None:
             self._current_item = item
-            self._load_session(data)
+            self._load_form(data)
             self._set_form_enabled(True)
         else:
             self._current_item = None
             self._set_form_enabled(False)
 
-    # ── Form helpers ──────────────────────────────────────────────────────
+    def _show_context_menu(self, pos: QPoint):
+        menu = QMenu(self)
+        menu.addAction("New Site",   self._new_site)
+        menu.addAction("New Folder", self._new_folder)
+        item = self._tree.itemAt(pos)
+        if item:
+            menu.addSeparator()
+            menu.addAction("Rename", lambda: self._tree.editItem(item))
+            act_del = menu.addAction("Delete")
+            act_del.triggered.connect(self._delete_item)
+        menu.exec(self._tree.viewport().mapToGlobal(pos))
 
-    def _load_session(self, data: SessionData):
-        self._building = True
+    def _on_item_renamed(self, item: QTreeWidgetItem, _col):
+        if self._loading:
+            return
+        # If it's a session leaf, sync the name field too
+        data = self._get_data(item)
+        if data is not None:
+            data.name = item.text(0)
+            if self._current_item is item:
+                self._loading = True
+                self._f_name.setText(item.text(0))
+                self._loading = False
+        self._save_to_disk()
+
+    # ── Form ──────────────────────────────────────────────────────────────
+
+    def _load_form(self, data: SessionData):
+        self._loading = True
+        self._f_name.setText(data.name)
         self._f_protocol.setCurrentText(data.protocol)
         self._f_host.setText(data.host)
         self._f_port.setValue(data.port)
@@ -348,14 +376,15 @@ class SiteManager(QDialog):
         self._f_keyfile.setText(data.key_file)
         self._f_remote_dir.setText(data.remote_dir)
         self._f_local_dir.setText(data.local_dir)
-        self._building = False
+        self._loading = False
 
     def _save_current(self):
         if self._current_item is None:
             return
-        data = _item_data(self._current_item)
+        data = self._get_data(self._current_item)
         if data is None:
             return
+        data.name       = self._f_name.text().strip() or "New Session"
         data.protocol   = self._f_protocol.currentText()
         data.host       = self._f_host.text().strip()
         data.port       = self._f_port.value()
@@ -364,15 +393,22 @@ class SiteManager(QDialog):
         data.key_file   = self._f_keyfile.text().strip()
         data.remote_dir = self._f_remote_dir.text().strip()
         data.local_dir  = self._f_local_dir.text().strip()
-        label = f"{data.user}@{data.host}" if data.user and data.host else data.host or "New Session"
+
+        # Update tree label with display name (or user@host if name is default)
+        label = data.name if data.name != "New Session" else (
+            f"{data.user}@{data.host}" if data.user and data.host else
+            data.host or data.name)
+        self._loading = True
         self._current_item.setText(0, label)
+        self._loading = False
+
         self._save_to_disk()
 
     def _do_connect(self):
         self._save_current()
         if self._current_item is None:
             return
-        data = _item_data(self._current_item)
+        data = self._get_data(self._current_item)
         if not data or not data.host:
             QMessageBox.warning(self, "Missing host", "Please enter a host name.")
             return
@@ -380,21 +416,27 @@ class SiteManager(QDialog):
         self.accept()
 
     def _on_protocol_changed(self, proto: str):
-        if self._building:
+        if self._loading:
             return
         defaults = {"SFTP": 22, "SCP": 22, "FTP": 21, "FTPS": 990, "WebDAV": 80, "S3": 443}
         self._f_port.setValue(defaults.get(proto, 22))
 
     def _set_form_enabled(self, enabled: bool):
-        for w in (self._f_protocol, self._f_host, self._f_port, self._f_user,
-                  self._f_password, self._f_keyfile, self._f_remote_dir, self._f_local_dir,
+        for w in (self._f_name, self._f_protocol, self._f_host, self._f_port,
+                  self._f_user, self._f_password, self._f_keyfile,
+                  self._f_remote_dir, self._f_local_dir,
                   self._btn_browse_key, self._btn_browse_local,
                   self._btn_save, self._btn_connect):
             w.setEnabled(enabled)
 
+    def closeEvent(self, event):
+        self._save_to_disk()
+        super().closeEvent(event)
+
     def _browse_key(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select private key", "", "Key files (*.pem *.ppk *.key);;All files (*)")
+            self, "Select private key", "",
+            "Key files (*.pem *.ppk *.key);;All files (*)")
         if path:
             self._f_keyfile.setText(path)
 
@@ -404,9 +446,9 @@ class SiteManager(QDialog):
             self._f_local_dir.setText(path)
 
 
-# ── Module-level helpers ───────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-def _stored_to_session_data(ss: "StoredSession") -> "SessionData":
+def _stored_to_session_data(ss: StoredSession) -> SessionData:
     d = SessionData()
     d.name       = ss.name
     d.protocol   = ss.protocol
